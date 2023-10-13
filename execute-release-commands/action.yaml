@@ -1,0 +1,102 @@
+name: execute-release-commands
+description: "Execute commands for Telepresence releases"
+inputs:
+  gh_auto_release_token:
+    description: "The token to use to authenticate with GitHub"
+    required: true
+  gh_auto_release_email:
+    description: "The email to use to authenticate with GitHub"
+    required: true
+  gh_auto_release_user:
+    description: "The user to use to authenticate with GitHub"
+    required: true
+  telepresence_version:
+    description: "The current release of Telepresence in the form of vX.Y.Z[-rc.N]"
+    required: true
+  repository:
+    description: "The repository to upgrade"
+    required: true
+  pre_push_branch_commands:
+    description: "The commands to run before pushing to the branch"
+    required: true
+  post_push_branch_commands:
+    description: "The post commands to run after pushing to the branch"
+    required: false
+runs:
+  using: composite
+  steps:
+    - name: Set environment variables
+      shell: bash
+      run: |
+        echo "RELEASE_BRANCH_NAME=release/$(echo ${{ inputs.telepresence_version }} | sed 's/^v//;s/-rc\.[0-9]*$//')" >> $GITHUB_ENV
+
+    - name: Check and create branch if not exists
+      shell: bash
+      run: |
+        # Determine the default branch
+        DEFAULT_BRANCH=$(curl --silent -H "Authorization: token ${{ inputs.gh_auto_release_token }}" \
+          "https://api.github.com/repos/${{ inputs.repository }}" | jq -r '.default_branch')
+        
+        echo "The default branch is: $DEFAULT_BRANCH"
+
+        # Check if the target branch exists
+        BRANCH_EXISTS=$(curl --silent --fail -H "Authorization: token ${{ inputs.gh_auto_release_token }}" \
+          "https://api.github.com/repos/${{ inputs.repository }}/branches/$RELEASE_BRANCH_NAME" || echo "not exists")
+      
+        
+        # If branch doesn't exist, create it using the latest commit from the default branch
+        if [[ "$BRANCH_EXISTS" == "not exists" ]]; then
+          echo "The release branch $RELEASE_BRANCH_NAME does not exists."
+          SHA=$(curl --silent -H "Authorization: token ${{ inputs.gh_auto_release_token }}" \
+            "https://api.github.com/repos/${{ inputs.repository }}/git/ref/heads/$DEFAULT_BRANCH" | jq '.object.sha')
+          curl --fail -X POST -H "Authorization: token ${{ inputs.gh_auto_release_token }}" \
+            -d '{"ref":"refs/heads/'$RELEASE_BRANCH_NAME'", "sha":'$SHA'}' \
+            "https://api.github.com/repos/${{ inputs.repository }}/git/refs"
+        fi
+
+    - name: Checkout other repo
+      uses: actions/checkout@v3
+      with:
+        path: remote_repo
+        repository: ${{ inputs.repository }}
+        token: ${{ inputs.GH_AUTO_RELEASE_TOKEN }}
+        persist-credentials: false
+        ref: ${{ env.RELEASE_BRANCH_NAME }}
+
+    - name: Setup Git Config
+      shell: bash
+      run: |
+        set -x
+
+        git config --global user.email '${{ inputs.GH_AUTO_RELEASE_EMAIL }}'
+        git config --global user.name '${{ inputs.GH_AUTO_RELEASE_USER }}'
+        git config --global credential.helper 'store --file=/tmp/git-credentials'
+        echo "https://x-access-token:${{ inputs.GH_AUTO_RELEASE_TOKEN }}@github.com" > /tmp/git-credentials
+
+    - uses: actions/setup-go@v3
+      with:
+        go-version: '~1.21.0'
+
+    - name: Install GoMock
+      shell: bash
+      run: go install github.com/golang/mock/mockgen@v1.6.0
+
+    - name: Execute commands
+      shell: bash
+      working-directory: ./remote_repo
+      env:
+        TELEPRESENCE_VERSION: ${{ inputs.telepresence_version }}
+      run: |
+        ${{ inputs.pre_push_branch_commands }}
+        git push origin HEAD:${{ env.RELEASE_BRANCH_NAME }}
+
+    - name: Execute post commands
+      if: ${{ inputs.post_push_branch_commands }}
+      shell: bash
+      working-directory: ./remote_repo
+      env:
+        TELEPRESENCE_VERSION: ${{ inputs.telepresence_version }}
+      run: |
+        ${{ inputs.post_push_branch_commands }} 
+
+
