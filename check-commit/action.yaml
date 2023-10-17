@@ -1,0 +1,75 @@
+name: Check commit
+description: "Check commit"
+outputs:
+  telepresence_version:
+    description: "The telepresence version"
+    value: ${{ steps.commit_message.outputs.telepresence_version }}
+runs:
+  using: composite
+  steps:
+    - name: Check Commit Message
+      id: commit_message
+      env:
+        GH_TOKEN: ${{ github.token }}
+      shell: bash
+      run: |
+        # Determine the default branch
+        DEFAULT_BRANCH=$(curl --silent -H "Authorization: token ${{ github.token }}" \
+        "https://api.github.com/repos/${{ github.repository }}" | jq -r '.default_branch')
+        
+        git fetch origin $DEFAULT_BRANCH
+        
+        if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          current_version=$(echo ${{ github.head_ref }} | sed -e "s/^release\///")
+          BASE_REF=$(git rev-parse refs/remotes/origin/${{ github.base_ref }})
+          HEAD_REF=$(git rev-parse refs/remotes/origin/${{ github.head_ref }})
+          echo $BASE_REF
+        fi
+        
+        if [[ "${{ github.event.label.name }}" == "GA" ]]; then
+          REVIEWS_JSON=$(gh pr view ${{ github.event.pull_request.number }} --json reviews)
+          APPROVALS=$(echo "$REVIEWS_JSON" | jq '[.reviews[] | select(.state == "APPROVED")] | length')
+          if [ "$APPROVALS" -lt "1" ]; then
+            echo "No approvals found. GA requires at least 1 approval."
+            exit 1
+          fi
+          commit_subject=$(git log "$BASE_REF".."$HEAD_REF" --format=%s | grep -m1 "^Prepare v${current_version}$") || true
+        
+          if [[ ! -z "$commit_subject" ]]; then
+            echo "GA - Commit found. Remove GA prepare commit."
+            exit 1
+          else
+            echo "GA - No match found."
+            echo "telepresence_version=v$current_version" >> $GITHUB_OUTPUT
+          fi
+        
+        else
+          if [[ "${{ github.event.label.name }}" == "RC" ]]; then
+            commit_subject=$(git log "$BASE_REF".."$HEAD_REF" --format=%s | grep -m1 "^Prepare v${current_version}\+\(-rc\.[0-9]\+\)\?$") || true
+          else
+            current_version=$(echo $GITHUB_REF | sed -e "s/^refs\/heads\/release\///")
+            commit_subject=$(git log FETCH_HEAD..HEAD --format=%s | grep -m1 "^Prepare v${current_version}\+\(-rc\.[0-9]\+\)\?$") || true
+          fi
+        
+          # If grep doesn't find a match, it will return an empty string
+          if [[ ! -z "$commit_subject" ]]; then
+            # Check if commit subject matches the pattern and includes the 'v'
+            if [[ "$commit_subject" =~ ^Prepare\ (v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?)$ ]]; then
+              version=${BASH_REMATCH[1]}
+        
+              if [[ "$version" =~ -rc\.([0-9]+)$ ]]; then
+                RC_NUM=${BASH_REMATCH[1]}
+                NEXT_RC_NUM=$((RC_NUM+1))
+                NEXT_TAG="v${current_version}-rc.$NEXT_RC_NUM"
+                echo "telepresence_version=$NEXT_TAG" >> $GITHUB_OUTPUT
+                echo "The next telepresence version is: $NEXT_TAG"
+              fi
+      
+            fi
+          else
+            echo "No match found."
+            NEXT_TAG="v${current_version}-rc.0"
+            echo "telepresence_version=$NEXT_TAG" >> $GITHUB_OUTPUT
+            echo "The next telepresence version is: $NEXT_TAG"
+          fi
+        fi
